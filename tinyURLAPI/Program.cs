@@ -1,4 +1,5 @@
 using Microsoft.Data.SqlClient;
+using System.Data;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -6,30 +7,30 @@ var builder = WebApplication.CreateBuilder(args);
 
 var connectionString = builder.Configuration.GetConnectionString("AzureSql");
 
-
-// Add services to the container.
-// Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
 var app = builder.Build();
 
-// Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
     app.UseSwaggerUI();
 }
 
-app.UseHttpsRedirection();
-app.MapGet("/{code:length(6)}", async (string code) =>
+//
+// ----------------------------------------------------
+// REDIRECT: GET /{shortCode} 
+// ----------------------------------------------------
+app.MapGet("/{code}", async (string code) =>
 {
     using var conn = new SqlConnection(connectionString);
     await conn.OpenAsync();
 
     var cmd = new SqlCommand(@"
-        SELECT OriginalUrl, AccessCount 
-        FROM UrlMappings WHERE ShortCode = @code
+        SELECT OriginalUrl, VisitCount, ExpiresAt, IsActive
+        FROM ShortUrls
+        WHERE ShortCode = @code
     ", conn);
 
     cmd.Parameters.AddWithValue("@code", code);
@@ -39,21 +40,31 @@ app.MapGet("/{code:length(6)}", async (string code) =>
     if (!reader.Read())
         return Results.NotFound(new { message = "Short code not found" });
 
-    var originalUrl = reader.GetString(0);
-    var accessCount = reader.GetInt32(1);
+    string originalUrl = reader.GetString(0);
+    int visitCount = reader.GetInt32(1);
+    DateTime? expiresAt = reader.IsDBNull(2) ? (DateTime?)null : reader.GetDateTime(2);
+    bool isActive = reader.GetBoolean(3);
+
+    // Check active status
+    if (!isActive)
+        return Results.BadRequest(new { message = "This short URL is disabled" });
+
+    // Check expiry
+    if (expiresAt != null && expiresAt < DateTime.UtcNow)
+        return Results.BadRequest(new { message = "This short URL has expired" });
 
     reader.Close();
 
-    // update access count
+    // Update visit count
     var updateCmd = new SqlCommand(@"
-        UPDATE UrlMappings SET 
-           AccessCount = @count, 
-           LastAccessedAt = SYSUTCDATETIME()
+        UPDATE ShortUrls
+        SET VisitCount = @count
         WHERE ShortCode = @code
     ", conn);
 
-    updateCmd.Parameters.AddWithValue("@count", accessCount + 1);
+    updateCmd.Parameters.AddWithValue("@count", visitCount + 1);
     updateCmd.Parameters.AddWithValue("@code", code);
+
     await updateCmd.ExecuteNonQueryAsync();
 
     return Results.Redirect(originalUrl);
@@ -61,9 +72,9 @@ app.MapGet("/{code:length(6)}", async (string code) =>
 
 
 //
-// -----------------------------------
+// ----------------------------------------------------
 // CREATE SHORT URL: POST /api/shorten
-// -----------------------------------
+// ----------------------------------------------------
 app.MapPost("/api/shorten", async (CreateShortRequest req) =>
 {
     if (string.IsNullOrWhiteSpace(req.OriginalUrl))
@@ -77,13 +88,15 @@ app.MapPost("/api/shorten", async (CreateShortRequest req) =>
     using var conn = new SqlConnection(connectionString);
     await conn.OpenAsync();
 
-    // If already exists return old short code
+    // Check if URL already exists (optional behavior)
     var findCmd = new SqlCommand(@"
-        SELECT ShortCode FROM UrlMappings WHERE OriginalUrl = @url
+        SELECT ShortCode FROM ShortUrls
+        WHERE OriginalUrl = @url AND IsActive = 1
     ", conn);
-    findCmd.Parameters.AddWithValue("@url", originalUrl);
 
+    findCmd.Parameters.AddWithValue("@url", originalUrl);
     var existing = await findCmd.ExecuteScalarAsync();
+
     if (existing != null)
     {
         return Results.Ok(new
@@ -100,44 +113,51 @@ app.MapPost("/api/shorten", async (CreateShortRequest req) =>
         code = ShortCodeGenerator.Generate(6);
 
         var checkCmd = new SqlCommand(@"
-            SELECT COUNT(*) FROM UrlMappings WHERE ShortCode = @code
+            SELECT COUNT(*) FROM ShortUrls WHERE ShortCode = @code
         ", conn);
 
         checkCmd.Parameters.AddWithValue("@code", code);
 
-        var count = (int)await checkCmd.ExecuteScalarAsync();
+        int count = (int)await checkCmd.ExecuteScalarAsync();
 
         if (count == 0) break;
 
     } while (true);
 
-    // Insert record
+    // INSERT
     var insertCmd = new SqlCommand(@"
-        INSERT INTO UrlMappings (ShortCode, OriginalUrl, CreatedAt)
-        VALUES (@code, @url, SYSUTCDATETIME())
+        INSERT INTO ShortUrls (ShortCode, OriginalUrl, CreatedAt, ExpiresAt, IsActive)
+        VALUES (@code, @url, SYSUTCDATETIME(), @expires, 1)
     ", conn);
 
     insertCmd.Parameters.AddWithValue("@code", code);
     insertCmd.Parameters.AddWithValue("@url", originalUrl);
+    insertCmd.Parameters.AddWithValue("@expires", (object?)req.ExpiresAt ?? DBNull.Value);
 
     await insertCmd.ExecuteNonQueryAsync();
 
-    return Results.Created($"/{code}", new { shortCode = code, originalUrl });
+    return Results.Created($"/{code}", new
+    {
+        shortCode = code,
+        originalUrl,
+        expiresAt = req.ExpiresAt
+    });
 });
 
 
 //
-// -----------------------------------
+// ----------------------------------------------------
 // GET INFO: GET /api/urls/{code}
-// -----------------------------------
-app.MapGet("/api/urls/{code:length(6)}", async (string code) =>
+// ----------------------------------------------------
+app.MapGet("/api/urls/{code}", async (string code) =>
 {
     using var conn = new SqlConnection(connectionString);
     await conn.OpenAsync();
 
     var cmd = new SqlCommand(@"
-        SELECT ShortCode, OriginalUrl, CreatedAt, AccessCount, LastAccessedAt
-        FROM UrlMappings WHERE ShortCode = @code
+        SELECT Id, ShortCode, OriginalUrl, CreatedAt, ExpiresAt, VisitCount, IsActive
+        FROM ShortUrls
+        WHERE ShortCode = @code
     ", conn);
 
     cmd.Parameters.AddWithValue("@code", code);
@@ -149,32 +169,36 @@ app.MapGet("/api/urls/{code:length(6)}", async (string code) =>
 
     return Results.Ok(new
     {
-        ShortCode = reader.GetString(0),
-        OriginalUrl = reader.GetString(1),
-        CreatedAt = reader.GetDateTime(2),
-        AccessCount = reader.GetInt32(3),
-        LastAccessedAt = reader.IsDBNull(4)? (DateTime?)null: reader.GetDateTime(4)
-});
+        Id = reader.GetInt32(0),
+        ShortCode = reader.GetString(1),
+        OriginalUrl = reader.GetString(2),
+        CreatedAt = reader.GetDateTime(3),
+        ExpiresAt = reader.IsDBNull(4) ? (DateTime?)null : reader.GetDateTime(4),
+        VisitCount = reader.GetInt32(5),
+        IsActive = reader.GetBoolean(6)
+    });
 });
 
 
 //
-// -----------------------------------
+// ----------------------------------------------------
 // LIST ALL: GET /api/urls
-// -----------------------------------
+// ----------------------------------------------------
 app.MapGet("/api/urls", async () =>
 {
     using var conn = new SqlConnection(connectionString);
     await conn.OpenAsync();
 
     var cmd = new SqlCommand(@"
-        SELECT ShortCode, OriginalUrl, CreatedAt, AccessCount 
-        FROM UrlMappings ORDER BY CreatedAt DESC
+        SELECT ShortCode, OriginalUrl, CreatedAt, VisitCount, IsActive
+        FROM ShortUrls
+        ORDER BY CreatedAt DESC
     ", conn);
 
     var list = new List<object>();
 
     using var reader = await cmd.ExecuteReaderAsync();
+
     while (await reader.ReadAsync())
     {
         list.Add(new
@@ -182,7 +206,8 @@ app.MapGet("/api/urls", async () =>
             ShortCode = reader.GetString(0),
             OriginalUrl = reader.GetString(1),
             CreatedAt = reader.GetDateTime(2),
-            AccessCount = reader.GetInt32(3)
+            VisitCount = reader.GetInt32(3),
+            IsActive = reader.GetBoolean(4)
         });
     }
 
@@ -191,28 +216,36 @@ app.MapGet("/api/urls", async () =>
 
 
 //
-// -----------------------------------
-// DELETE: DELETE /api/urls/{code}
-// -----------------------------------
-app.MapDelete("/api/urls/{code:length(6)}", async (string code) =>
+// ----------------------------------------------------
+// SOFT DELETE / DISABLE URL: PUT /api/urls/{code}/disable
+// ----------------------------------------------------
+app.MapPut("/api/urls/{code}/disable", async (string code) =>
 {
     using var conn = new SqlConnection(connectionString);
     await conn.OpenAsync();
 
     var cmd = new SqlCommand(@"
-        DELETE FROM UrlMappings WHERE ShortCode = @code
+        UPDATE ShortUrls SET IsActive = 0 WHERE ShortCode = @code
     ", conn);
 
     cmd.Parameters.AddWithValue("@code", code);
 
     int rows = await cmd.ExecuteNonQueryAsync();
 
-    return rows > 0 ? Results.NoContent() : Results.NotFound();
+    return rows > 0 ? Results.Ok(new { message = "Short URL disabled" }) : Results.NotFound();
 });
 
 app.Run();
 
-public record CreateShortRequest(string OriginalUrl);
+
+//
+// ----------------- MODELS -----------------
+
+public record CreateShortRequest(string OriginalUrl, DateTime? ExpiresAt);
+
+
+//
+// ----------------- SHORT CODE GENERATOR -----------------
 
 public static class ShortCodeGenerator
 {
@@ -225,9 +258,8 @@ public static class ShortCodeGenerator
 
         var sb = new StringBuilder(length);
         foreach (var b in bytes)
-        {
             sb.Append(Alphabet[b % Alphabet.Length]);
-        }
+
         return sb.ToString();
     }
 }
